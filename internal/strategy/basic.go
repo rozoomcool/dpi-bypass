@@ -3,7 +3,7 @@ package strategy
 import (
 	"log"
 
-	"github.com/yourname/dpi-bypass/tlsparser"
+	"github.com/rozoomcool/dpi-bypass/internal/tlsparser"
 )
 
 func ApplyBasicObfuscation(ch *tlsparser.ClientHello) {

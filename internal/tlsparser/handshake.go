@@ -102,3 +102,69 @@ func (ch *ClientHello) AddPadding(padSize int) {
 	padding := make([]byte, padSize)
 	ch.Extensions[ExtensionPadding] = padding
 }
+
+func (ch *ClientHello) Serialize() ([]byte, error) {
+	buf := &bytes.Buffer{}
+
+	// Handshake Layer Payload
+	body := &bytes.Buffer{}
+
+	// Version
+	binary.Write(body, binary.BigEndian, ch.Version)
+
+	// Random
+	body.Write(ch.Random)
+
+	// Session ID
+	body.WriteByte(uint8(len(ch.SessionID)))
+	body.Write(ch.SessionID)
+
+	// Cipher Suites
+	binary.Write(body, binary.BigEndian, uint16(len(ch.CipherSuites)*2))
+	for _, cs := range ch.CipherSuites {
+		binary.Write(body, binary.BigEndian, cs)
+	}
+
+	// Compression (null compression)
+	body.WriteByte(1)
+	body.WriteByte(0)
+
+	// Extensions
+	extBuf := &bytes.Buffer{}
+	for extType, extData := range ch.Extensions {
+		binary.Write(extBuf, binary.BigEndian, extType)
+		binary.Write(extBuf, binary.BigEndian, uint16(len(extData)))
+		extBuf.Write(extData)
+	}
+
+	if extBuf.Len() > 0 {
+		binary.Write(body, binary.BigEndian, uint16(extBuf.Len()))
+		body.Write(extBuf.Bytes())
+	} else {
+		binary.Write(body, binary.BigEndian, uint16(0))
+	}
+
+	handshakePayload := body.Bytes()
+
+	// Handshake Header
+	buf.WriteByte(0x01) // HandshakeType: ClientHello
+	writeUint24(buf, len(handshakePayload))
+	buf.Write(handshakePayload)
+
+	handshakeRecord := buf.Bytes()
+
+	// TLS Record Layer
+	record := &bytes.Buffer{}
+	record.WriteByte(0x16)           // ContentType: Handshake
+	record.Write([]byte{0x03, 0x03}) // TLS version 1.2 (фиксируем пока для большинства DPI)
+	binary.Write(record, binary.BigEndian, uint16(len(handshakeRecord)))
+	record.Write(handshakeRecord)
+
+	return record.Bytes(), nil
+}
+
+func writeUint24(buf *bytes.Buffer, val int) {
+	buf.WriteByte(byte(val >> 16))
+	buf.WriteByte(byte(val >> 8))
+	buf.WriteByte(byte(val))
+}
