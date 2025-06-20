@@ -12,7 +12,7 @@ type ClientHello struct {
 	SessionID    []byte
 	CipherSuites []uint16
 	Extensions   map[uint16][]byte
-	ServerName   string // кешируем SNI для удобства
+	ServerName   string
 }
 
 const (
@@ -20,17 +20,32 @@ const (
 	ExtensionPadding = 0x15
 )
 
-func ParseClientHello(data []byte) (*ClientHello, error) {
-	if len(data) < 5 || data[0] != 0x16 {
-		return nil, errors.New("invalid TLS record")
+// Main entry point for streaming proxy:
+func TryParseClientHello(data []byte) (*ClientHello, error) {
+	if len(data) < 5 {
+		return nil, errors.New("incomplete TLS record")
+	}
+	if data[0] != 0x16 {
+		return nil, errors.New("not TLS Handshake record")
 	}
 
-	payload := data[5:]
-	if payload[0] != 0x01 {
-		return nil, errors.New("not ClientHello")
+	recordLength := int(binary.BigEndian.Uint16(data[3:5]))
+	if len(data) < 5+recordLength {
+		return nil, errors.New("incomplete TLS record payload")
+	}
+
+	payload := data[5 : 5+recordLength]
+	if len(payload) < 4 || payload[0] != 0x01 {
+		return nil, errors.New("not ClientHello handshake")
+	}
+
+	handshakeLength := int(payload[1])<<16 | int(payload[2])<<8 | int(payload[3])
+	if len(payload[4:]) < handshakeLength {
+		return nil, errors.New("incomplete ClientHello body")
 	}
 
 	reader := bytes.NewReader(payload[4:])
+
 	ch := &ClientHello{}
 	binary.Read(reader, binary.BigEndian, &ch.Version)
 
@@ -62,18 +77,17 @@ func ParseClientHello(data []byte) (*ClientHello, error) {
 
 	for pos := 0; pos < int(extLen); {
 		var extType uint16
-		var extLen uint16
+		var extDataLen uint16
 		binary.Read(reader, binary.BigEndian, &extType)
-		binary.Read(reader, binary.BigEndian, &extLen)
+		binary.Read(reader, binary.BigEndian, &extDataLen)
 
-		extData := make([]byte, extLen)
+		extData := make([]byte, extDataLen)
 		reader.Read(extData)
 
 		ch.Extensions[extType] = extData
-		pos += 4 + int(extLen)
+		pos += 4 + int(extDataLen)
 
 		if extType == ExtensionSNI {
-			// парсим SNI
 			if len(extData) >= 5 {
 				sniReader := bytes.NewReader(extData[2:])
 				var nameType uint8
@@ -88,16 +102,15 @@ func ParseClientHello(data []byte) (*ClientHello, error) {
 			}
 		}
 	}
+
 	return ch, nil
 }
 
-// Удалить SNI extension
 func (ch *ClientHello) RemoveSNI() {
 	delete(ch.Extensions, ExtensionSNI)
 	ch.ServerName = ""
 }
 
-// Добавить Padding extension
 func (ch *ClientHello) AddPadding(padSize int) {
 	padding := make([]byte, padSize)
 	ch.Extensions[ExtensionPadding] = padding
@@ -106,28 +119,25 @@ func (ch *ClientHello) AddPadding(padSize int) {
 func (ch *ClientHello) Serialize() ([]byte, error) {
 	buf := &bytes.Buffer{}
 
-	// Handshake Layer Payload
-	body := &bytes.Buffer{}
-
 	// Version
-	binary.Write(body, binary.BigEndian, ch.Version)
+	binary.Write(buf, binary.BigEndian, ch.Version)
 
 	// Random
-	body.Write(ch.Random)
+	buf.Write(ch.Random)
 
 	// Session ID
-	body.WriteByte(uint8(len(ch.SessionID)))
-	body.Write(ch.SessionID)
+	binary.Write(buf, binary.BigEndian, uint8(len(ch.SessionID)))
+	buf.Write(ch.SessionID)
 
 	// Cipher Suites
-	binary.Write(body, binary.BigEndian, uint16(len(ch.CipherSuites)*2))
+	binary.Write(buf, binary.BigEndian, uint16(len(ch.CipherSuites)*2))
 	for _, cs := range ch.CipherSuites {
-		binary.Write(body, binary.BigEndian, cs)
+		binary.Write(buf, binary.BigEndian, cs)
 	}
 
-	// Compression (null compression)
-	body.WriteByte(1)
-	body.WriteByte(0)
+	// Compression methods
+	buf.WriteByte(1) // Length
+	buf.WriteByte(0) // null compression
 
 	// Extensions
 	extBuf := &bytes.Buffer{}
@@ -137,28 +147,25 @@ func (ch *ClientHello) Serialize() ([]byte, error) {
 		extBuf.Write(extData)
 	}
 
-	if extBuf.Len() > 0 {
-		binary.Write(body, binary.BigEndian, uint16(extBuf.Len()))
-		body.Write(extBuf.Bytes())
-	} else {
-		binary.Write(body, binary.BigEndian, uint16(0))
-	}
+	binary.Write(buf, binary.BigEndian, uint16(extBuf.Len()))
+	buf.Write(extBuf.Bytes())
 
-	handshakePayload := body.Bytes()
+	handshakePayload := buf.Bytes()
 
-	// Handshake Header
-	buf.WriteByte(0x01) // HandshakeType: ClientHello
-	writeUint24(buf, len(handshakePayload))
-	buf.Write(handshakePayload)
+	// Build Handshake layer
+	handshake := &bytes.Buffer{}
+	handshake.WriteByte(0x01) // ClientHello
+	writeUint24(handshake, len(handshakePayload))
+	handshake.Write(handshakePayload)
 
-	handshakeRecord := buf.Bytes()
+	handshakeBytes := handshake.Bytes()
 
-	// TLS Record Layer
+	// Build TLS Record Layer
 	record := &bytes.Buffer{}
-	record.WriteByte(0x16)           // ContentType: Handshake
-	record.Write([]byte{0x03, 0x03}) // TLS version 1.2 (фиксируем пока для большинства DPI)
-	binary.Write(record, binary.BigEndian, uint16(len(handshakeRecord)))
-	record.Write(handshakeRecord)
+	record.WriteByte(0x16)           // Handshake ContentType
+	record.Write([]byte{0x03, 0x03}) // TLS version 1.2 (мы фиксируем тут TLS 1.2)
+	binary.Write(record, binary.BigEndian, uint16(len(handshakeBytes)))
+	record.Write(handshakeBytes)
 
 	return record.Bytes(), nil
 }

@@ -7,9 +7,9 @@ import (
 )
 
 func ApplyBasicObfuscation(ch *tlsparser.ClientHello) {
-	log.Println("[Strategy] Applying basic DPI bypass: Remove SNI + Add Padding")
+	log.Println("[Strategy] Applying DPI bypass: Remove SNI + Add Padding")
 
-	// Удаляем SNI
+	// Удаляем SNI extension
 	ch.RemoveSNI()
 
 	// Добавляем Padding (например, 256 байт)

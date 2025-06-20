@@ -1,72 +1,127 @@
 package proxy
 
 import (
-	"io"
+	"errors"
 	"log"
-	"net"
 	"time"
 
+	"github.com/google/gopacket"
+	"github.com/google/gopacket/layers"
 	"github.com/rozoomcool/dpi-bypass/internal/strategy"
 	"github.com/rozoomcool/dpi-bypass/internal/tlsparser"
+	"github.com/songgao/water"
 )
 
-func Start(listenAddr string) error {
-	ln, err := net.Listen("tcp", listenAddr)
-	if err != nil {
-		return err
-	}
-	log.Printf("Listening on %s\n", listenAddr)
+type ConnectionKey struct {
+	SrcIP, DstIP     string
+	SrcPort, DstPort uint16
+}
+
+type TCPConnection struct {
+	Key           ConnectionKey
+	Buffer        []byte
+	NextSeq       uint32
+	Modified      bool
+	EstablishedAt time.Time
+}
+
+var connections = make(map[ConnectionKey]*TCPConnection)
+
+func Start(dev *water.Interface) {
+	buf := make([]byte, 65535)
 
 	for {
-		client, err := ln.Accept()
+		n, err := dev.Read(buf)
 		if err != nil {
-			log.Println(err)
+			log.Fatal(err)
+		}
+
+		packet := gopacket.NewPacket(buf[:n], layers.LayerTypeIPv4, gopacket.Default)
+		ipLayer := packet.Layer(layers.LayerTypeIPv4)
+		if ipLayer == nil {
 			continue
 		}
-		go handle(client)
+		ip, _ := ipLayer.(*layers.IPv4)
+
+		if ip.Protocol != layers.IPProtocolTCP {
+			continue
+		}
+
+		tcpLayer := packet.Layer(layers.LayerTypeTCP)
+		if tcpLayer == nil {
+			continue
+		}
+		tcp, _ := tcpLayer.(*layers.TCP)
+
+		key := ConnectionKey{
+			SrcIP:   ip.SrcIP.String(),
+			DstIP:   ip.DstIP.String(),
+			SrcPort: uint16(tcp.SrcPort),
+			DstPort: uint16(tcp.DstPort),
+		}
+
+		conn, exists := connections[key]
+		if !exists {
+			conn = &TCPConnection{
+				Key:           key,
+				Buffer:        []byte{},
+				NextSeq:       uint32(tcp.Seq) + uint32(len(tcp.Payload)),
+				Modified:      false,
+				EstablishedAt: time.Now(),
+			}
+			connections[key] = conn
+		} else {
+			if uint32(tcp.Seq) != conn.NextSeq {
+				log.Printf("Out of order packet: got %d expected %d", tcp.Seq, conn.NextSeq)
+				continue
+			}
+			conn.NextSeq += uint32(len(tcp.Payload))
+		}
+
+		// Пропускаем служебные пакеты (SYN, FIN, RST)
+		if tcp.SYN || tcp.FIN || tcp.RST {
+			dev.Write(buf[:n])
+			continue
+		}
+
+		if len(tcp.Payload) == 0 {
+			dev.Write(buf[:n])
+			continue
+		}
+
+		// Добавляем в stream
+		conn.Buffer = append(conn.Buffer, tcp.Payload...)
+
+		// Пробуем парсить ClientHello
+		if !conn.Modified {
+			ch, err := tryParseTLSClientHello(conn.Buffer)
+			if err == nil {
+				log.Println("Intercepted ClientHello! SNI:", ch.ServerName)
+				strategy.ApplyBasicObfuscation(ch)
+
+				modifiedData, err := ch.Serialize()
+				if err == nil {
+					conn.Buffer = modifiedData
+					conn.Modified = true
+					log.Println("ClientHello modified!")
+				}
+			}
+		}
+
+		// Отправляем модифицированный пакет
+		err = InjectModifiedPacket(dev, ip, tcp, conn.Buffer)
+		if err != nil {
+			log.Println("Injection failed:", err)
+		}
 	}
 }
 
-func handle(client net.Conn) {
-	defer client.Close()
-
-	client.SetReadDeadline(time.Now().Add(10 * time.Second))
-
-	buf := make([]byte, 8192)
-	n, err := client.Read(buf)
-	if err != nil {
-		log.Println("Error reading ClientHello:", err)
-		return
+func tryParseTLSClientHello(data []byte) (*tlsparser.ClientHello, error) {
+	if len(data) < 5 {
+		return nil, errors.New("not enough data")
 	}
-
-	ch, err := tlsparser.ParseClientHello(buf[:n])
-	if err != nil {
-		log.Println("Failed parsing TLS:", err)
-		return
+	if data[0] != 0x16 || data[5] != 0x01 {
+		return nil, errors.New("not TLS ClientHello")
 	}
-
-	log.Printf("Intercepted TLS for host: %s", ch.ServerName)
-
-	// Применяем стратегию обхода
-	strategy.ApplyBasicObfuscation(ch)
-
-	modifiedData, err := ch.Serialize()
-	if err != nil {
-		log.Println("Failed serialize:", err)
-		return
-	}
-
-	// Подключаемся к оригинальному хосту
-	remote, err := net.Dial("tcp", ch.ServerName+":443")
-	if err != nil {
-		log.Println("Remote connect failed:", err)
-		return
-	}
-	defer remote.Close()
-
-	remote.Write(modifiedData)
-
-	// Дальше двунаправленный стриминг
-	go io.Copy(remote, client)
-	io.Copy(client, remote)
+	return tlsparser.TryParseClientHello(data)
 }
